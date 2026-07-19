@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+vector_db/
+node_modules/
+frontend/dist/
+.venv/
+downloades/
