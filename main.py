@@ -50,8 +50,6 @@ app = FastAPI(
 )
 
 # Tell the security guard (CORS) to let your frontend (e.g., React) talk to this backend (Python)
-
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,6 +65,11 @@ app.add_middleware(
 # A simple dictionary. Think of this like a wall of lockers at a gym.
 # We will store the AI "chat bots" (RAG chains) for each user here so they can chat with their specific video later.
 ACTIVE_SESSIONS: Dict[str, Any] = {}
+
+# A second wall of lockers, this one tracks the STATUS of each video being processed
+# (queued / processing / done / error) so the frontend can check in on long-running jobs
+# without needing to keep one single request open the whole time.
+JOBS: Dict[str, Any] = {}
 
 
 # ==========================================
@@ -110,14 +113,14 @@ def run_pipeline_sync(source: str, language: str) -> dict:
 
         logger.info("Transcribing audio...")
         transcript = transcribe_all(chunks, language) # Transcribe the audio to text using your code
-        
+
         logger.info("Generating insights...")
         title = generate_title(transcript) # Generate the title
         summary = summarize(transcript) # Generate the summary
         action_items = extract_action_items(transcript) # Extract tasks
         decisions = extract_key_decisions(transcript) # Extract decisions
         questions = extract_questions(transcript) # Extract questions
-        
+
         logger.info("Building RAG chain...")
         rag_chain = build_rag_chain(transcript) # Build the chat brain (RAG) so it can answer questions based on the text
 
@@ -133,7 +136,36 @@ def run_pipeline_sync(source: str, language: str) -> dict:
         }
     except Exception as e: # If ANY line of code above fails (e.g., internet drops, corrupt video)...
         logger.error(f"Pipeline failure: {str(e)}") # Write the exact error in the diary
-        raise RuntimeError(f"Pipeline processing failed: {str(e)}") # Shout the error so the Endpoint knows
+        raise RuntimeError(f"Pipeline processing failed: {str(e)}") # Shout the error so the caller knows
+
+
+# This is the version of the heavy lifter that runs quietly in the background.
+# Instead of making the frontend wait on one single request (which a tunnel can time out),
+# it updates the JOBS locker as it goes, so the frontend can check in periodically instead.
+def run_pipeline_background(job_id: str, source: str, language: str):
+    try:
+        JOBS[job_id]["status"] = "processing"
+        result = run_pipeline_sync(source, language)
+
+        session_id = str(uuid.uuid4())
+        ACTIVE_SESSIONS[session_id] = result["rag_chain"]
+        logger.info(f"Session created: {session_id}")
+
+        JOBS[job_id] = {
+            "status": "done",
+            "data": {
+                "session_id": session_id,
+                "title": result["title"],
+                "transcript_preview": result["transcript"][:300] + "...",
+                "summary": result["summary"],
+                "action_items": result["action_items"],
+                "key_decisions": result["key_decisions"],
+                "open_questions": result["open_questions"],
+            },
+        }
+    except Exception as e:
+        logger.error(f"Background job failed: {str(e)}")
+        JOBS[job_id] = {"status": "error", "error": str(e)}
 
 
 # ==========================================
@@ -148,55 +180,43 @@ async def health_check():
     return {"status": "healthy", "active_sessions": len(ACTIVE_SESSIONS)}
 
 
-# DOOR 2: The main door to send and process a video.
-# When the frontend sends video data to "http://127.0.0.1:8000/api/v1/process"...
-@app.post("/api/v1/process", response_model=ProcessResponse, tags=["Processing"])
-async def process_video(request: ProcessRequest):
-    try:
-        # Pure magic here! Since AI processing takes minutes, we send it to a background "thread" (asyncio.to_thread).
-        # This way, the main server stays free to help other users while waiting for the heavy lifter to finish.
-        result = await asyncio.to_thread(run_pipeline_sync, request.source, request.language)
-        
-        # We generate a completely random and unique alphanumeric text string (e.g., "f47ac10b-58cc...")
-        session_id = str(uuid.uuid4())
-        
-        # We save this video's specific "Chat Bot" (RAG) in our locker dictionary, using the random text as the key.
-        ACTIVE_SESSIONS[session_id] = result["rag_chain"]
-        logger.info(f"Session created: {session_id}")
+# DOOR 2: The main door to kick off video processing.
+# This no longer waits for the whole pipeline to finish — it starts the work in the
+# background and immediately hands back a job_id, so the request returns in milliseconds
+# instead of staying open for the whole transcription + summarization time.
+@app.post("/api/v1/process", tags=["Processing"])
+async def process_video(request: ProcessRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued"}
+    background_tasks.add_task(run_pipeline_background, job_id, request.source, request.language)
+    logger.info(f"Job queued: {job_id}")
+    return {"job_id": job_id}
 
-        # We send all the generated summaries back to the frontend (React) and, very importantly, the locker key (session_id).
-        return ProcessResponse(
-            session_id=session_id,
-            title=result["title"],
-            transcript_preview=result["transcript"][:300] + "...", # We only send the first 300 characters so we don't clutter the screen.
-            summary=result["summary"],
-            action_items=result["action_items"],
-            key_decisions=result["key_decisions"],
-            open_questions=result["open_questions"]
-        )
 
-    # If the "heavy lifter" function above shouted that there was an error...
-    except RuntimeError as e:
-        # ...We officially tell the user their request failed by sending a 500 Error
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e: # For any other weird, unknown error
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during processing.")
+# DOOR 2b: The status door. The frontend polls this every few seconds to check whether
+# a job is still queued/processing, finished ("done", with the full data attached),
+# or failed ("error", with the error message attached).
+@app.get("/api/v1/status/{job_id}", tags=["Processing"])
+async def get_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
 
 
 # DOOR 3: The Chat Door.
 # When the React frontend sends a chat message to "http://127.0.0.1:8000/api/v1/chat"...
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat_with_meeting(request: ChatRequest):
-    
+
     # 1. We check our wall of lockers to see if the key the user sent (session_id) actually exists
     rag_chain = ACTIVE_SESSIONS.get(request.session_id)
-    
+
     # If the locker is empty or the key doesn't exist (maybe the server restarted)...
     if not rag_chain:
         # We tell them Error 404 (Not found)
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail="Session not found or expired. Please process the video again."
         )
 
@@ -204,10 +224,10 @@ async def chat_with_meeting(request: ChatRequest):
         # 2. We ask the AI model the user's question. (Again, we use asyncio so we don't freeze the server while the AI "thinks" of the answer)
         logger.info(f"Answering question for session {request.session_id}")
         answer = await asyncio.to_thread(ask_question, rag_chain, request.question)
-        
+
         # 3. We send the AI's text answer back to the user's screen in React
         return ChatResponse(answer=answer)
-        
+
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to generate an answer.")
@@ -217,13 +237,13 @@ async def chat_with_meeting(request: ChatRequest):
 # AI models take up a lot of RAM. When a user closes the webpage, we need them to let us know so we can delete their data.
 @app.delete("/api/v1/sessions/{session_id}", tags=["System"])
 async def end_session(session_id: str):
-    
+
     # If the user's key matches a valid locker in our memory...
     if session_id in ACTIVE_SESSIONS:
         # ...We use 'del' to delete the contents of that locker and free up space in the computer's RAM.
         del ACTIVE_SESSIONS[session_id]
         logger.info(f"Session deleted: {session_id}")
         return {"status": "success", "message": f"Session {session_id} deleted."}
-    
+
     # If for some reason they try to delete a locker that doesn't exist...
     raise HTTPException(status_code=404, detail="Session not found.")
