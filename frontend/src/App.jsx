@@ -2,7 +2,6 @@ import { useState } from 'react';
 
 const WAVE_HEIGHTS = [40, 65, 30, 80, 55, 20, 70, 45, 90, 35, 60, 25, 75, 50, 85, 40, 65, 30, 55, 20, 70, 45, 80, 35];
 const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-
 function formatContent(text) {
   if (!text) return null;
   return text
@@ -50,35 +49,16 @@ function App() {
     setChatHistory([]);
 
     try {
-      // Step 1: kick off processing. The backend returns immediately with a job_id
-      // instead of making us wait on one single request for the whole pipeline —
-      // that's what avoids the tunnel/proxy timing out on long videos.
-      const startResponse = await fetch(`${API_BASE}/api/v1/process`, {
+      const response = await fetch(`${API_BASE}/api/v1/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source: source, language: "english" }),
       });
 
-      if (!startResponse.ok) throw new Error("Failed to start processing");
-      const { job_id } = await startResponse.json();
+      if (!response.ok) throw new Error("Processing failed");
 
-      // Step 2: poll the status endpoint every few seconds until it's done or errors out.
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-
-        const statusResponse = await fetch(`${API_BASE}/api/v1/status/${job_id}`);
-        if (!statusResponse.ok) throw new Error("Lost track of the job status");
-        const statusData = await statusResponse.json();
-
-        if (statusData.status === "done") {
-          setVideoData(statusData.data);
-          break;
-        }
-        if (statusData.status === "error") {
-          throw new Error(statusData.error || "Processing failed");
-        }
-        // otherwise status is "queued" or "processing" — just keep polling
-      }
+      const data = await response.json();
+      setVideoData(data);
     } catch (error) {
       setProcessError("Signal lost — check that the backend is running on :8000.");
       console.error(error);
