@@ -50,12 +50,14 @@ app = FastAPI(
 )
 
 # Tell the security guard (CORS) to let your frontend (e.g., React) talk to this backend (Python)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # The "*" means "allow ANY website to connect". (In the real world, you'd put only your React URL here for security).
-    allow_credentials=True, # Allows cookies or passwords to be sent.
-    allow_methods=["*"], # Allows any type of request (GET to ask for data, POST to send, DELETE to remove, etc.).
-    allow_headers=["*"], # Allows any type of hidden header in the request.
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ==========================================
